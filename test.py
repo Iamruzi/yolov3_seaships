@@ -1,27 +1,31 @@
 import argparse
 import json
-
+import torch
 from torch.utils.data import DataLoader
 
 from models import *
 from utils.datasets import *
 from utils.utils import *
+import cv2
+import coastline_saliency_fusion as csf
 
 
-def test(cfg,
-         data,
-         weights=None,
-         batch_size=16,
-         img_size=416,
-         iou_thres=0.5,
-         conf_thres=0.001,
-         nms_thres=0.5,
-         save_json=False,
-         model=None):
-    # Initialize/load model and set device
+def test(
+        cfg,
+        data_cfg,
+        weights=None,
+        batch_size=16,
+        img_size=416,
+        iou_thres=0.5,
+        conf_thres=0.001,
+        nms_thres=0.5,
+        save_json=False,
+        model=None
+):
+    low_iou_thres = 0.3;
+
     if model is None:
         device = torch_utils.select_device()
-        verbose = True
 
         # Initialize model
         model = Darknet(cfg, img_size).to(device)
@@ -36,13 +40,12 @@ def test(cfg,
             model = nn.DataParallel(model)
     else:
         device = next(model.parameters()).device  # get model device
-        verbose = False
 
     # Configure run
-    data = parse_data_cfg(data)
-    nc = int(data['classes'])  # number of classes
-    test_path = data['valid']  # path to test images
-    names = load_classes(data['names'])  # class names
+    data_cfg = parse_data_cfg(data_cfg)
+    nc = int(data_cfg['classes'])  # number of classes
+    test_path = data_cfg['valid']  # path to test images
+    names = load_classes(data_cfg['names'])  # class names
 
     # Dataloader
     dataset = LoadImagesAndLabels(test_path, img_size, batch_size)
@@ -55,37 +58,41 @@ def test(cfg,
     seen = 0
     model.eval()
     coco91class = coco80_to_coco91_class()
-    s = ('%30s' + '%10s' * 6) % ('Class', 'Images', 'Targets', 'P', 'R', 'mAP', 'F1')
+    print(('%20s' + '%10s' * 6) % ('Class', 'Images', 'Targets', 'P', 'R', 'mAP', 'F1'))
     loss, p, r, f1, mp, mr, map, mf1 = 0., 0., 0., 0., 0., 0., 0., 0.
     jdict, stats, ap, ap_class = [], [], [], []
-    for batch_i, (imgs, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
+    count_saliency = 0
+    for batch_i, (imgs, targets, paths, shapes) in enumerate(tqdm(dataloader, desc='Computing mAP')):
         targets = targets.to(device)
         imgs = imgs.to(device)
         _, _, height, width = imgs.shape  # batch size, channels, height, width
 
+        im0 = cv2.imread(paths[0])
+
         # Plot images with bounding boxes
         if batch_i == 0 and not os.path.exists('test_batch0.jpg'):
-            plot_images(imgs=imgs, targets=targets, paths=paths, fname='test_batch0.jpg')
+            plot_images(imgs=imgs, targets=targets, fname='test_batch0.jpg')
 
         # Run model
         inf_out, train_out = model(imgs)  # inference and training outputs
 
         # Compute loss
         if hasattr(model, 'hyp'):  # if model has loss hyperparameters
-            loss += compute_loss(train_out, targets, model)[0].item()
+            loss_i, _ = compute_loss(train_out, targets, model)
+            loss += loss_i.item()
 
         # Run NMS
         output = non_max_suppression(inf_out, conf_thres=conf_thres, nms_thres=nms_thres)
-
         # Statistics per image
         for si, pred in enumerate(output):
+            # 这个output含7个数，分别是预测的一个船只的x1 y1 x2 y2, obj_conf, class_conf, class_pred
             labels = targets[targets[:, 0] == si, 1:]
             nl = len(labels)
             tcls = labels[:, 0].tolist() if nl else []  # target class
             seen += 1
 
-            if pred is None:
-                if nl:
+            if pred is None: # 代表这张图片没有检测到船只
+                if nl:   # 虽然没有检测到船只，但是标签上却显示有船只
                     stats.append(([], torch.Tensor(), torch.Tensor(), tcls))
                 continue
 
@@ -102,17 +109,16 @@ def test(cfg,
                 box = xyxy2xywh(box)  # xywh
                 box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
                 for di, d in enumerate(pred):
-                    jdict.append({'image_id': image_id,
-                                  'category_id': coco91class[int(d[6])],
-                                  'bbox': [floatn(x, 3) for x in box[di]],
-                                  'score': floatn(d[4], 5)})
-
-            # Clip boxes to image bounds
-            clip_coords(pred, (height, width))
+                    jdict.append({
+                        'image_id': image_id,
+                        'category_id': coco91class[int(d[6])],
+                        'bbox': [float3(x) for x in box[di]],
+                        'score': float(d[4])
+                    })
 
             # Assign all predictions as incorrect
             correct = [0] * len(pred)
-            if nl:
+            if nl:  #nl表示这张照片上实际有多少船只，如果有船只，则计算正确率召回率等
                 detected = []
                 tcls_tensor = labels[:, 0]
 
@@ -123,42 +129,55 @@ def test(cfg,
 
                 # Search for correct predictions
                 for i, (*pbox, pconf, pcls_conf, pcls) in enumerate(pred):
+                    # pbox是预测的船只的坐标，剩下三个是obj_conf,class_conf,class类别
 
                     # Break if all targets already located in image
                     if len(detected) == nl:
                         break
 
                     # Continue if predicted class not among image classes
-                    if pcls.item() not in tcls:
+                    if pcls.item() not in tcls: #预测的船只类别错误，则跳过
                         continue
 
                     # Best iou, index between pred and targets
                     m = (pcls == tcls_tensor).nonzero().view(-1)
                     iou, bi = bbox_iou(pbox, tbox[m]).max(0)
 
+                    # if low_iou_thres < iou < iou_thres:
+                    #     if len(pbox) < 4:
+                    #         pass
+                    #     else:
+                    #         print('old',len(pbox))
+                    #         pbox = csf.coastline_saliency_fusion(im0, pbox)
+                    #         if len(pbox)==1:
+                    #             print(pbox)
+                    #         print('new',len(pbox))
+                    #         count_saliency = count_saliency + 1
+
+                    iou, bi = bbox_iou(pbox, tbox[m]).max(0)
+                    
                     # If iou > threshold and class is correct mark as correct
                     if iou > iou_thres and m[bi] not in detected:  # and pcls == tcls[bi]:
-                        correct[i] = 1
+                        correct[i] = 1  # iou大于阈值，视为检测成功
                         detected.append(m[bi])
+
 
             # Append statistics (correct, conf, pcls, tcls)
             stats.append((correct, pred[:, 4].cpu(), pred[:, 6].cpu(), tcls))
 
     # Compute statistics
     stats = [np.concatenate(x, 0) for x in list(zip(*stats))]  # to numpy
+    nt = np.bincount(stats[3].astype(np.int64), minlength=nc)  # number of targets per class
     if len(stats):
         p, r, ap, f1, ap_class = ap_per_class(*stats)
         mp, mr, map, mf1 = p.mean(), r.mean(), ap.mean(), f1.mean()
-        nt = np.bincount(stats[3].astype(np.int64), minlength=nc)  # number of targets per class
-    else:
-        nt = torch.zeros(1)
 
     # Print results
-    pf = '%30s' + '%10.3g' * 6  # print format
+    pf = '%20s' + '%10.3g' * 6  # print format
     print(pf % ('all', seen, nt.sum(), mp, mr, map, mf1))
 
     # Print results per class
-    if verbose and nc > 1 and len(stats):
+    if nc > 1 and len(stats):
         for i, c in enumerate(ap_class):
             print(pf % (names[c], seen, nt[c], p[i], r[i], ap[i], f1[i]))
 
@@ -168,35 +187,36 @@ def test(cfg,
         with open('results.json', 'w') as file:
             json.dump(jdict, file)
 
-        from pycocotools.coco import COCO
-        from pycocotools.cocoeval import COCOeval
+        # from pycocotools.coco import COCO
+        # from pycocotools.cocoeval import COCOeval
 
         # https://github.com/cocodataset/cocoapi/blob/master/PythonAPI/pycocoEvalDemo.ipynb
-        cocoGt = COCO('../coco/annotations/instances_val2014.json')  # initialize COCO ground truth api
-        cocoDt = cocoGt.loadRes('results.json')  # initialize COCO pred api
-
-        cocoEval = COCOeval(cocoGt, cocoDt, 'bbox')
-        cocoEval.params.imgIds = imgIds  # [:32]  # only evaluate these images
-        cocoEval.evaluate()
-        cocoEval.accumulate()
-        cocoEval.summarize()
-        map = cocoEval.stats[1]  # update mAP to pycocotools mAP
+        # cocoGt = COCO('../coco/annotations/instances_val2014.json')  # initialize COCO ground truth api
+        # cocoDt = cocoGt.loadRes('results.json')  # initialize COCO pred api
+        #
+        # cocoEval = COCOeval(cocoGt, cocoDt, 'bbox')
+        # cocoEval.params.imgIds = imgIds  # [:32]  # only evaluate these images
+        # cocoEval.evaluate()
+        # cocoEval.accumulate()
+        # cocoEval.summarize()
+        # map = cocoEval.stats[1]  # update mAP to pycocotools mAP
 
     # Return results
     maps = np.zeros(nc) + map
     for i, c in enumerate(ap_class):
         maps[c] = ap[i]
+    print(count_saliency,'个框经过了重定位')
     return (mp, mr, map, mf1, loss / len(dataloader)), maps
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(prog='test.py')
-    parser.add_argument('--batch-size', type=int, default=16, help='size of each image batch')
-    parser.add_argument('--cfg', type=str, default='cfg/yolov3-spp.cfg', help='cfg file path')
-    parser.add_argument('--data', type=str, default='data/coco.data', help='coco.data file path')
-    parser.add_argument('--weights', type=str, default='weights/yolov3-spp.weights', help='path to weights file')
+    parser.add_argument('--batch-size', type=int, default=1, help='size of each image batch')
+    parser.add_argument('--cfg', type=str, default='cfg/yolov3.cfg', help='cfg file path')
+    parser.add_argument('--data-cfg', type=str, default='data/coco.data', help='coco.data file path')
+    parser.add_argument('--weights', type=str, default='weights/latest.pt', help='path to weights file')
     parser.add_argument('--iou-thres', type=float, default=0.5, help='iou threshold required to qualify as detected')
-    parser.add_argument('--conf-thres', type=float, default=0.001, help='object confidence threshold')
+    parser.add_argument('--conf-thres', type=float, default=0.24, help='object confidence threshold')
     parser.add_argument('--nms-thres', type=float, default=0.5, help='iou threshold for non-maximum suppression')
     parser.add_argument('--save-json', action='store_true', help='save a cocoapi-compatible JSON results file')
     parser.add_argument('--img-size', type=int, default=416, help='inference size (pixels)')
@@ -204,12 +224,14 @@ if __name__ == '__main__':
     print(opt)
 
     with torch.no_grad():
-        mAP = test(opt.cfg,
-                   opt.data,
-                   opt.weights,
-                   opt.batch_size,
-                   opt.img_size,
-                   opt.iou_thres,
-                   opt.conf_thres,
-                   opt.nms_thres,
-                   opt.save_json)
+        mAP = test(
+            opt.cfg,
+            opt.data_cfg,
+            opt.weights,
+            opt.batch_size,
+            opt.img_size,
+            opt.iou_thres,
+            opt.conf_thres,
+            opt.nms_thres,
+            opt.save_json
+        )
