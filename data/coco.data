@@ -1,6 +1,6 @@
-classes=80
-train=../coco/trainvalno5k.txt
-valid=../coco/5k.txt
-names=data/coco.names
+classes=6
+train=data/train_seaship_ore.txt
+valid=D:\python_files\yolov3\data\train_seaship_mini.txt
+names=data/Seaships.names
 backup=backup/
 eval=coco
